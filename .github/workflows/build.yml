@@ -1,0 +1,105 @@
+name: build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  GODOT_VERSION: 4.7.2
+  BLENDER_VERSION: 4.4.3
+  DOTNET_NOLOGO: 1
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: 8.0.x }
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb mesa-vulkan-drivers libvulkan1 libegl1 libgl1 libxi6 libxkbcommon0 libsm6 libxrender1 libxfixes3 libxxf86vm1 libxcursor1 libxinerama1 libxrandr2 libfontconfig1 >/dev/null
+          curl -fsSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_mono_linux_x86_64.zip"
+          unzip -q godot.zip -d "$RUNNER_TEMP/godot"
+          echo "GODOT=$RUNNER_TEMP/godot/Godot_v${GODOT_VERSION}-stable_mono_linux_x86_64/Godot_v${GODOT_VERSION}-stable_mono_linux.x86_64" >> "$GITHUB_ENV"
+          rm godot.zip
+      - name: Build car model when its script changes
+        id: car
+        run: |
+          sha=$(sha256sum tools/build_car.py | cut -d' ' -f1)
+          if [ -f assets/car/car.glb ] && [ "$(cat assets/car/source.sha 2>/dev/null)" = "$sha" ]; then echo "Car unchanged"; exit 0; fi
+          curl -fsSL "https://download.blender.org/release/Blender${BLENDER_VERSION%.*}/blender-${BLENDER_VERSION}-linux-x64.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/blender-${BLENDER_VERSION}-linux-x64/blender" -b -noaudio -P tools/build_car.py --python-exit-code 1
+          test -s assets/car/car.glb
+          echo "$sha" > assets/car/source.sha
+          echo "changed=1" >> "$GITHUB_OUTPUT"
+      - name: Compile and import
+        run: |
+          dotnet build MySim.csproj -v q
+          "$GODOT" --headless --path . --import || true
+          test -f assets/car/car.glb.import
+      - name: Checks
+        run: MYSIM_CHECKS=1 timeout 1500 "$GODOT" --headless --path . --fixed-fps 120 2>&1 | tee checks.log; test "${PIPESTATUS[0]}" = 0
+        shell: bash
+      - name: Pictures
+        if: always()
+        run: |
+          mkdir -p shots
+          MYSIM_SHOTS="$PWD/shots" timeout 1500 xvfb-run -a -s "-screen 0 1280x720x24" "$GODOT" --path . --fixed-fps 60 --resolution 1280x720 --rendering-driver vulkan 2>&1 | tail -30 | tee shots.log
+          ls -la shots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: review
+          path: |
+            shots/*.png
+            checks.log
+            shots.log
+          retention-days: 7
+      - name: Save the generated car model
+        if: steps.car.outputs.changed == '1' && github.ref == 'refs/heads/main'
+        run: |
+          git config user.name github-actions; git config user.email github-actions@users.noreply.github.com
+          git add assets/car
+          git commit -m "Generated car model [skip ci]" && git pull --rebase -q origin main && git push -q origin main
+
+  windows:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: 8.0.x }
+      - uses: actions/cache@v4
+        id: tpl
+        with:
+          path: ~/.local/share/godot/export_templates
+          key: templates-${{ env.GODOT_VERSION }}
+      - name: Engine and templates
+        run: |
+          curl -fsSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_mono_linux_x86_64.zip"
+          unzip -q godot.zip -d "$RUNNER_TEMP/godot"; rm godot.zip
+          echo "GODOT=$RUNNER_TEMP/godot/Godot_v${GODOT_VERSION}-stable_mono_linux_x86_64/Godot_v${GODOT_VERSION}-stable_mono_linux.x86_64" >> "$GITHUB_ENV"
+          d="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable.mono"
+          if [ ! -d "$d" ]; then
+            curl -fsSL -o t.tpz "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_mono_export_templates.tpz"
+            mkdir -p "$d"; unzip -q t.tpz -d "$RUNNER_TEMP/t"; mv "$RUNNER_TEMP"/t/templates/* "$d"/; rm t.tpz
+          fi
+      - name: Export
+        run: |
+          sudo apt-get install -y -qq libfontconfig1 >/dev/null
+          dotnet build MySim.csproj -v q
+          "$GODOT" --headless --path . --import || true
+          mkdir -p build
+          "$GODOT" --headless --path . --export-release "Windows" build/MySim.exe
+          test -f build/MySim.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MySim-Windows
+          path: build/
+          retention-days: 30
